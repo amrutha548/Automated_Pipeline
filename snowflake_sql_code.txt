@@ -1,0 +1,282 @@
+
+-- Ensure database, schema, and warehouse
+CREATE DATABASE IF NOT EXISTS weather_database;
+USE DATABASE weather_database;
+
+CREATE SCHEMA IF NOT EXISTS public;
+USE SCHEMA public;
+
+CREATE WAREHOUSE IF NOT EXISTS weather_warehouse
+WITH WAREHOUSE_SIZE = 'SMALL'
+AUTO_SUSPEND = 60
+AUTO_RESUME = TRUE;
+
+-- Create target table
+CREATE OR REPLACE TABLE my_table (
+    json_data VARIANT
+);
+
+-- Create and enable the storage integration
+CREATE OR REPLACE STORAGE INTEGRATION my_s3_integration
+TYPE = EXTERNAL_STAGE
+STORAGE_PROVIDER = 'S3'
+ENABLED = TRUE
+STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::257394468377:role/weather_role'
+STORAGE_ALLOWED_LOCATIONS = ('s3://weather-streambucket');
+ALTER STORAGE INTEGRATION my_s3_integration SET ENABLED = TRUE;
+
+DESCRIBE INTEGRATION my_s3_integration;
+
+-- Create the stage
+CREATE OR REPLACE STAGE my_stage
+STORAGE_INTEGRATION = my_s3_integration
+URL = 's3://weather-streambucket/weather_data/';
+
+LIST @my_stage;
+
+-- Create file format
+CREATE OR REPLACE FILE FORMAT my_file_format
+TYPE = 'JSON';
+
+-- Create notification integration
+CREATE OR REPLACE NOTIFICATION INTEGRATION my_notification_integration
+ENABLED = TRUE
+TYPE = QUEUE
+NOTIFICATION_PROVIDER = AWS_SNS
+AWS_SNS_TOPIC_ARN = 'arn:aws:sns:ap-south-1:257394468377:weather_sns'
+AWS_SNS_ROLE_ARN = 'arn:aws:iam::257394468377:role/weather_role'
+DIRECTION = OUTBOUND;
+
+-- Create the pipe for auto-ingest
+CREATE OR REPLACE PIPE my_pipe
+AUTO_INGEST = TRUE
+AS
+COPY INTO my_table
+FROM @my_stage
+FILE_FORMAT = (FORMAT_NAME = my_file_format);
+
+SHOW PIPES;
+ALTER PIPE my_pipe REFRESH;
+
+select * from my_table;
+--.......................................................................................
+
+--Permissions
+
+GRANT USAGE ON DATABASE WEATHER_DATABASE TO ROLE ACCOUNTADMIN;
+GRANT USAGE ON SCHEMA WEATHER_DATABASE.PUBLIC TO ROLE ACCOUNTADMIN;
+GRANT SELECT ON ALL TABLES IN SCHEMA WEATHER_DATABASE.PUBLIC TO ROLE ACCOUNTADMIN;
+GRANT SELECT ON FUTURE TABLES IN SCHEMA WEATHER_DATABASE.PUBLIC TO ROLE ACCOUNTADMIN;
+GRANT USAGE ON WAREHOUSE WEATHER_WAREHOUSE TO ROLE ACCOUNTADMIN;
+GRANT OPERATE ON WAREHOUSE WEATHER_WAREHOUSE TO ROLE ACCOUNTADMIN;
+
+--.......................................................................................
+
+SELECT CURRENT_DATE;
+SHOW PARAMETERS LIKE 'TIMEZONE';
+ALTER SESSION SET TIMEZONE = 'Asia/Kolkata'; -- Replace with your desired time zone
+
+SHOW PARAMETERS LIKE 'TIMEZONE';
+SELECT CURRENT_DATE, CURRENT_TIMESTAMP;
+----------------------------------------------------------------------------------------
+
+-- APACHE SUPERSET
+
+SHOW GRANTS TO USER amruthammu;
+
+-- Query 1: Data Transformation 
+SELECT
+    json_data:NewItem.city.S::STRING AS city,
+    json_data:NewItem.date.S::DATE AS date,
+    REPLACE(json_data:NewItem.humidity.S::STRING, '%', '')::FLOAT AS humidity,
+    REPLACE(json_data:NewItem.temperature.S::STRING, '°C', '')::FLOAT AS temperature,
+    json_data:NewItem.weather.S::STRING AS weather,
+    json_data:NewItem.timestamp.S::TIMESTAMP_NTZ AS event_timestamp
+FROM my_table;
+
+-- Query 2: Insert Transformed Data
+CREATE OR REPLACE TABLE weather_data_cleaned (
+    city STRING,
+    date DATE,
+    humidity FLOAT,
+    temperature FLOAT,
+    weather STRING,
+    event_timestamp TIMESTAMP_NTZ
+);
+
+
+INSERT INTO weather_data_cleaned (city, date, humidity, temperature, weather, event_timestamp)
+SELECT
+    json_data:NewItem.city.S::STRING AS city,
+    json_data:NewItem.date.S::DATE AS date,
+    REPLACE(json_data:NewItem.humidity.S::STRING, '%', '')::FLOAT AS humidity,
+    REPLACE(json_data:NewItem.temperature.S::STRING, '°C', '')::FLOAT AS temperature,
+    json_data:NewItem.weather.S::STRING AS weather,
+    json_data:NewItem.timestamp.S::TIMESTAMP_NTZ AS event_timestamp
+FROM my_table;
+
+
+-- Query 3: Average Temperature and Forecast
+WITH all_temps AS (
+    SELECT
+        city,
+        REPLACE(temperature, '°C', '')::float AS temp,
+        date
+    FROM weather_data_cleaned
+),
+average_and_forecast AS (
+    SELECT
+        city,
+        AVG(temp) AS avg_temperature
+    FROM all_temps
+    GROUP BY city
+)
+SELECT
+    a.city,
+    (CURRENT_DATE + INTERVAL '1 day') AS forecast_date,
+    ROUND(a.avg_temperature, 2) AS temperature_numeric,
+    CONCAT(ROUND(a.avg_temperature, 2), '°C') AS temperature_forecast
+FROM average_and_forecast a
+ORDER BY a.city;
+
+
+-- Query 4: Create Weather Forecast Table
+CREATE OR REPLACE TABLE weather_data AS
+WITH all_temps AS (
+    SELECT
+        city,
+        REPLACE(temperature, '°C', '')::float AS temp,
+        date
+    FROM weather_data_cleaned
+),
+average_and_forecast AS (
+    SELECT
+        city,
+        AVG(temp) AS avg_temperature
+    FROM all_temps
+    GROUP BY city
+)
+SELECT
+    a.city,
+    (CURRENT_DATE + INTERVAL '1 day') AS forecast_date,
+    ROUND(a.avg_temperature, 2) AS temperature_numeric,
+    CONCAT(ROUND(a.avg_temperature, 2), '°C') AS temperature_forecast
+FROM average_and_forecast a
+ORDER BY a.city;
+
+--.......................................................................................
+
+--Change data for visualization
+
+-- CTE for City Short Name Mapping
+WITH city_mapping AS (
+    SELECT 
+        city,
+        CASE
+            WHEN city = 'Mumbai' THEN 'BOM'
+            WHEN city = 'Delhi' THEN 'DEL'
+            WHEN city = 'Kolkata' THEN 'KOL'
+            WHEN city = 'Bangalore' THEN 'BLR'
+            WHEN city = 'Chennai' THEN 'CHE'
+            WHEN city = 'Hyderabad' THEN 'HYD'
+            WHEN city = 'Pune' THEN 'PUE'
+            WHEN city = 'Ahmedabad' THEN 'AMD'
+            WHEN city = 'Jaipur' THEN 'JAI'
+            WHEN city = 'Surat' THEN 'SUT'
+            WHEN city = 'Lucknow' THEN 'LKO'
+            WHEN city = 'Kanpur' THEN 'KNU'
+            WHEN city = 'Nagpur' THEN 'NAG'
+            WHEN city = 'Indore' THEN 'IDR'
+            WHEN city = 'Patna' THEN 'PAT'
+            ELSE city -- Default to full name if no mapping is found
+        END AS city_shortname
+    FROM weather_data_cleaned
+),
+-- Subquery to Clean Data and Add Shortened City Name
+all_temps AS (
+    SELECT
+        cm.city_shortname,
+        wdc.city,  -- Include original city name
+        REPLACE(temperature, '°C', '')::FLOAT AS temp,
+        date
+    FROM weather_data_cleaned wdc
+    JOIN city_mapping cm ON wdc.city = cm.city
+),
+-- Subquery for Calculating Average Temperature and Forecast
+average_and_forecast AS (
+    SELECT
+        city_shortname AS city,
+        city AS original_city,  -- Add original city name to the result
+        AVG(temp) AS avg_temperature
+    FROM all_temps
+    GROUP BY city_shortname, city
+)
+-- Final Select to Get the Forecasted Data
+SELECT
+    a.city,  -- Shortened city name
+    a.original_city,  -- Original city name
+    (CURRENT_DATE + INTERVAL '1 day') AS forecast_date,
+    ROUND(a.avg_temperature, 2) AS temperature_numeric,
+    CONCAT(ROUND(a.avg_temperature, 2), '°C') AS temperature_forecast
+FROM average_and_forecast a
+ORDER BY a.city;
+
+
+-- Create or Replace Weather Forecast Table with Original and Shortened City Names
+CREATE OR REPLACE TABLE weather_forecastdata AS
+WITH city_mapping AS (
+    SELECT 
+        city,
+        CASE
+            WHEN city = 'Mumbai' THEN 'BOM'
+            WHEN city = 'Delhi' THEN 'DEL'
+            WHEN city = 'Kolkata' THEN 'KOL'
+            WHEN city = 'Bangalore' THEN 'BLR'
+            WHEN city = 'Chennai' THEN 'CHE'
+            WHEN city = 'Hyderabad' THEN 'HYD'
+            WHEN city = 'Pune' THEN 'PUE'
+            WHEN city = 'Ahmedabad' THEN 'AMD'
+            WHEN city = 'Jaipur' THEN 'JAI'
+            WHEN city = 'Surat' THEN 'SUT'
+            WHEN city = 'Lucknow' THEN 'LKO'
+            WHEN city = 'Kanpur' THEN 'KNU'
+            WHEN city = 'Nagpur' THEN 'NAG'
+            WHEN city = 'Indore' THEN 'IDR'
+            WHEN city = 'Patna' THEN 'PAT'
+            ELSE city -- Default to full name if no mapping is found
+        END AS city_shortname
+    FROM weather_data_cleaned
+),
+-- Subquery to Clean Data and Add Shortened City Name
+all_temps AS (
+    SELECT
+        cm.city_shortname,
+        wdc.city,  -- Include original city name
+        REPLACE(temperature, '°C', '')::FLOAT AS temp,
+        date
+    FROM weather_data_cleaned wdc
+    JOIN city_mapping cm ON wdc.city = cm.city
+),
+-- Subquery for Calculating Average Temperature and Forecast
+average_and_forecast AS (
+    SELECT
+        city_shortname AS city,
+        city AS original_city,  -- Add original city name to the result
+        AVG(temp) AS avg_temperature
+    FROM all_temps
+    GROUP BY city_shortname, city
+)
+-- Final Select to Get the Forecasted Data
+SELECT
+    a.city,  -- Shortened city name
+    a.original_city,  -- Original city name
+    (CURRENT_DATE + INTERVAL '1 day') AS forecast_date,
+    ROUND(a.avg_temperature, 2) AS temperature_numeric,
+    CONCAT(ROUND(a.avg_temperature, 2), '°C') AS temperature_forecast
+FROM average_and_forecast a
+ORDER BY a.city;
+
+
+
+
+--........................................................................................
